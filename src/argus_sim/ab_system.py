@@ -43,6 +43,12 @@ class ABPhot:
         Calculate the number of photons from a given flux density.
     photons_from_mag(band_name, mag)
         Calculate the number of photons from a given magnitude.
+    photons_from_sed(band_name, wavelength, flux_density)
+        Calculate the filter-transmitted photon rate from an arbitrary SED.
+    mag_from_sed(band_name, wavelength, flux_density)
+        Calculate the synthetic AB magnitude from an arbitrary SED.
+    electrons_from_sed(band_name, wavelength, flux_density, airmass, transparency)
+        Calculate the detected electron rate from an arbitrary SED through the full system.
     mag_from_photons(band_name, photons)
         Calculate the magnitude from a given number of photons.
 
@@ -122,6 +128,226 @@ class ABPhot:
             * u.cm ** (-2)
         )
         return (photon_density).cgs * self.collecting_area * u.photon
+
+    def _sed_flux_lambda_on_grid(
+        self,
+        band_name: str,
+        wavelength: u.Quantity,
+        flux_density: u.Quantity,
+        allow_partial: bool = False,
+    ) -> np.ndarray:
+        """Interpolate an input SED onto the system wavelength grid.
+
+        The input flux density may be expressed per unit wavelength (for
+        example, ``erg / s / cm2 / Angstrom``) or per unit frequency (for
+        example, ``Jy``). It is converted to ``F_lambda`` before interpolation.
+        Uncovered filter support raises unless ``allow_partial=True``.
+
+        Parameters
+        ----------
+        band_name : str
+            Name of the loaded filter band.
+        wavelength : astropy.units.Quantity
+            One-dimensional wavelength array.
+        flux_density : astropy.units.Quantity
+            One-dimensional spectral flux-density array sampled at
+            ``wavelength``.
+        allow_partial : bool, optional
+            If False (default), require the input SED to cover the full
+            non-zero support of the requested filter. If True, uncovered
+            wavelengths contribute zero flux.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``F_lambda`` sampled on ``SystemThroughput.wav`` in
+            erg s-1 cm-2 nm-1.
+
+        """
+        if band_name not in self.tp.filt_wav:
+            raise ValueError(f"Filter {band_name!r} is not loaded in SystemThroughput.")
+
+        if not isinstance(wavelength, u.Quantity) or not isinstance(flux_density, u.Quantity):
+            raise TypeError("wavelength and flux_density must be astropy Quantity arrays.")
+        if wavelength.ndim != 1 or flux_density.ndim != 1:
+            raise ValueError("wavelength and flux_density must be one-dimensional arrays.")
+        if wavelength.shape != flux_density.shape:
+            raise ValueError("wavelength and flux_density must have the same shape.")
+        if wavelength.size < 2:
+            raise ValueError("An SED must contain at least two wavelength samples.")
+        if not wavelength.unit.is_equivalent(u.nm):
+            raise u.UnitConversionError("wavelength must carry physical wavelength units.")
+
+        order = np.argsort(wavelength.to_value(u.nm))
+        wavelength = wavelength[order]
+        flux_density = flux_density[order]
+        wav_nm = wavelength.to_value(u.nm)
+        if not np.all(np.isfinite(wav_nm)) or np.any(wav_nm <= 0):
+            raise ValueError("wavelength must contain finite, positive values.")
+        if np.any(np.diff(wav_nm) <= 0):
+            raise ValueError("wavelength samples must be unique.")
+
+        target_unit = u.erg / (u.second * u.cm**2 * u.nm)
+        try:
+            flux_lambda = flux_density.to(target_unit, equivalencies=u.spectral_density(wavelength))
+        except u.UnitConversionError as exc:
+            raise u.UnitConversionError(
+                "flux_density must be a spectral flux density (for example F_lambda, F_nu, or Jy)."
+            ) from exc
+
+        flux_values = flux_lambda.to_value(target_unit)
+        if not np.all(np.isfinite(flux_values)):
+            raise ValueError("flux_density must contain only finite values.")
+
+        filter_response = np.asarray(self.tp.filt_wav[band_name], dtype=float)
+        support = filter_response > 0
+        if not np.any(support):
+            raise ValueError(f"Filter {band_name!r} has no non-zero throughput.")
+        system_wav_nm = self.tp.wav.to_value(u.nm)
+        # Unit conversion can move an endpoint by a few floating-point ulps.
+        # Snap only that numerical roundoff so an identical grid in Angstroms
+        # neither fails coverage nor loses its endpoint during interpolation.
+        for endpoint in (0, -1):
+            nearest = system_wav_nm[np.argmin(np.abs(system_wav_nm - wav_nm[endpoint]))]
+            if abs(wav_nm[endpoint] - nearest) <= 8 * np.finfo(float).eps * abs(nearest):
+                wav_nm[endpoint] = nearest
+        if not allow_partial:
+            support_min = system_wav_nm[support][0]
+            support_max = system_wav_nm[support][-1]
+            if wav_nm[0] > support_min or wav_nm[-1] < support_max:
+                raise ValueError(
+                    f"SED wavelength coverage ({wav_nm[0]:.1f}-{wav_nm[-1]:.1f} nm) does not cover the full "
+                    f"{band_name!r} band ({support_min:.1f}-{support_max:.1f} nm). "
+                    "Pass allow_partial=True to integrate the overlapping region only."
+                )
+
+        return np.interp(system_wav_nm, wav_nm, flux_values, left=0.0, right=0.0)
+
+    def photons_from_sed(
+        self,
+        band_name: str,
+        wavelength: u.Quantity,
+        flux_density: u.Quantity,
+        *,
+        allow_partial: bool = False,
+    ) -> u.Quantity[u.photon / u.second]:
+        """Calculate the filter-transmitted photon rate from an arbitrary SED.
+
+        This is the SED analogue of :meth:`photons_from_flux_density`. The
+        result includes the telescope collecting area and filter transmission,
+        but not optics, detector QE, or atmospheric extinction. This makes the
+        returned rate compatible with :meth:`mag_from_photons`.
+
+        Parameters
+        ----------
+        band_name : str
+            Name of the loaded filter band.
+        wavelength : astropy.units.Quantity
+            Wavelength samples for the SED.
+        flux_density : astropy.units.Quantity
+            Observer-frame spectral flux density above the atmosphere. Both
+            F_lambda and F_nu-like units are accepted.
+        allow_partial : bool, optional
+            Allow the SED to cover only part of the filter band. Uncovered
+            wavelengths are treated as zero flux. Default is False.
+
+        Returns
+        -------
+        astropy.units.Quantity
+            Filter-transmitted photon rate in photon s-1.
+
+        """
+        flux_lambda = self._sed_flux_lambda_on_grid(band_name, wavelength, flux_density, allow_partial)
+        photon_energy_erg = (c.h * c.c / self.tp.wav).to_value(u.erg)
+        response = np.asarray(self.tp.filt_wav[band_name], dtype=float)
+        integrand = flux_lambda * response / photon_energy_erg
+        rate = sing.trapezoid(integrand, self.tp.wav.to_value(u.nm)) * self.collecting_area.to_value(u.cm**2)
+        return rate * u.photon / u.second
+
+    def mag_from_sed(
+        self,
+        band_name: str,
+        wavelength: u.Quantity,
+        flux_density: u.Quantity,
+        *,
+        allow_partial: bool = False,
+    ) -> float:
+        """Calculate a synthetic AB magnitude by integrating an arbitrary SED.
+
+        ``wavelength`` and ``flux_density`` are Quantity arrays giving the
+        observer-frame source flux above the atmosphere. Both F_lambda and
+        F_nu-like units are accepted. By default the SED must cover the full
+        non-zero filter support; ``allow_partial=True`` treats uncovered
+        wavelengths as zero flux. The filter-only photon rate is calibrated
+        with the same AB zero point as :meth:`mag_from_photons`.
+        """
+        photons = self.photons_from_sed(band_name, wavelength, flux_density, allow_partial=allow_partial)
+        return self.mag_from_photons(band_name, photons)
+
+    def electrons_from_sed(
+        self,
+        band_name: str,
+        wavelength: u.Quantity,
+        flux_density: u.Quantity,
+        *,
+        airmass: float = 1.0,
+        transparency: float = 1.0,
+        allow_partial: bool = False,
+    ) -> u.Quantity[u.electron / u.second]:
+        """Calculate the detected electron rate from an arbitrary SED.
+
+        The SED is integrated through the requested filter and the complete
+        Argus response: optics throughput, detector QE, and atmospheric
+        transmission raised to ``airmass``. ``transparency`` is an additional
+        grey attenuation factor, matching the survey simulator's cloud model.
+
+        Unlike the pre-tabulated AB-source signal throughput used by the survey
+        depth calculation, this method keeps the source SED inside the
+        wavelength integral. It therefore preserves source-colour dependence.
+
+        Parameters
+        ----------
+        band_name : str
+            Name of the loaded filter band.
+        wavelength : astropy.units.Quantity
+            Wavelength samples for the SED.
+        flux_density : astropy.units.Quantity
+            Observer-frame spectral flux density above the atmosphere. Both
+            F_lambda and F_nu-like units are accepted.
+        airmass : float, optional
+            Atmospheric airmass. Default is 1.0. Use 0.0 for no atmospheric
+            extinction.
+        transparency : float, optional
+            Additional grey atmospheric transparency factor in [0, 1].
+            Default is 1.0.
+        allow_partial : bool, optional
+            Allow the SED to cover only part of the filter band. Uncovered
+            wavelengths are treated as zero flux. Default is False.
+
+        Returns
+        -------
+        astropy.units.Quantity
+            Detected source electron rate in electron s-1, suitable for
+            :meth:`argus_sim.NoiseBudget.get_snr`.
+
+        """
+        if not np.isscalar(airmass) or not np.isfinite(airmass) or airmass < 0:
+            raise ValueError("airmass must be a finite scalar >= 0.")
+        if not np.isscalar(transparency) or not np.isfinite(transparency) or not 0 <= transparency <= 1:
+            raise ValueError("transparency must be a finite scalar in [0, 1].")
+
+        flux_lambda = self._sed_flux_lambda_on_grid(band_name, wavelength, flux_density, allow_partial)
+        photon_energy_erg = (c.h * c.c / self.tp.wav).to_value(u.erg)
+        response = (
+            np.asarray(self.tp.filt_wav[band_name], dtype=float)
+            * float(self.tp.optics[band_name])
+            * np.asarray(self.tp.qe_wav, dtype=float)
+            * np.asarray(self.tp.filt_wav.atmosphere, dtype=float) ** float(airmass)
+            * float(transparency)
+        )
+        integrand = flux_lambda * response / photon_energy_erg
+        rate = sing.trapezoid(integrand, self.tp.wav.to_value(u.nm)) * self.collecting_area.to_value(u.cm**2)
+        return rate * u.electron / u.second
 
     def photons_from_mag(self, band_name: str, mag: Union[float, npt.ArrayLike]) -> u.Quantity[u.second**-1]:
         """Calculate the number of photons from a given magnitude.
