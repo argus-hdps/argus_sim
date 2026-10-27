@@ -210,3 +210,19 @@ def test_the_same_store_on_s3_gives_the_same_visits_in_one_request_per_query(sto
         assert remote.io_stats()["get_requests"] - n0 <= 1
     finally:
         server.stop()
+
+
+@needs_run
+def test_a_store_naming_beta_g_reads_as_beta(store, run, tmp_path):
+    """Stores built before the rename call beta "g"; every band-keyed table reads back under beta."""
+    old = str(tmp_path / "store")
+    shutil.copytree(store, old)
+    idx = json.load(open(os.path.join(old, "index.json")))
+    with open(os.path.join(old, "index.json"), "w") as f:
+        f.write(json.dumps(idx).replace('"beta', '"g'))
+    legacy = SurveyRun(old)
+    assert json.load(open(os.path.join(old, "index.json")))["bands"][0] == "g"
+    assert legacy.bands == run.bands
+    assert legacy.zeropoints == run.zeropoints
+    assert legacy.meta["span"] == run.meta["span"]
+    assert legacy._depth_groups == run._depth_groups
