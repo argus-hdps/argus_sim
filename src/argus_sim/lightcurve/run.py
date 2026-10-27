@@ -59,6 +59,8 @@ class SurveyRun:
             )
         self.bands = [canonical_band(b) for b in self.meta["bands"]]
         self.zeropoints = {canonical_band(b): dict(v) for b, v in self.meta["zeropoints"].items()}
+        if "span" in self.meta:
+            self.meta["span"] = {canonical_band(b): v for b, v in self.meta["span"].items()}
         self._depth_groups = {
             f"{canonical_band(k.split('/', 1)[0])}/{k.split('/', 1)[1]}": v
             for k, v in self.meta["depth"]["row_groups"].items()
